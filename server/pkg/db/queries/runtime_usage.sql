@@ -1,6 +1,10 @@
 -- name: ListRuntimeUsage :many
+-- Bucket by tu.created_at (usage report time, ~= task completion time), not
+-- atq.created_at (task enqueue time), so tasks that queue one day and execute
+-- the next are attributed to the day tokens were actually produced. The since
+-- cutoff is truncated to start-of-day so `days=N` yields full calendar days.
 SELECT
-    DATE(atq.created_at) AS date,
+    DATE(tu.created_at) AS date,
     tu.provider,
     tu.model,
     SUM(tu.input_tokens)::bigint AS input_tokens,
@@ -10,9 +14,9 @@ SELECT
 FROM task_usage tu
 JOIN agent_task_queue atq ON atq.id = tu.task_id
 WHERE atq.runtime_id = $1
-  AND atq.created_at >= @since::timestamptz
-GROUP BY DATE(atq.created_at), tu.provider, tu.model
-ORDER BY DATE(atq.created_at) DESC, tu.provider, tu.model;
+  AND tu.created_at >= DATE_TRUNC('day', @since::timestamptz)
+GROUP BY DATE(tu.created_at), tu.provider, tu.model
+ORDER BY DATE(tu.created_at) DESC, tu.provider, tu.model;
 
 -- name: GetRuntimeTaskHourlyActivity :many
 SELECT EXTRACT(HOUR FROM started_at)::int AS hour, COUNT(*)::int AS count

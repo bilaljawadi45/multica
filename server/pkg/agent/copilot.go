@@ -22,6 +22,152 @@ type copilotBackend struct {
 	cfg Config
 }
 
+// copilotEventState holds mutable state accumulated while processing the JSONL
+// event stream. It is shared between production (Execute) and tests via
+// handleCopilotEvent, so the parsing logic is never duplicated.
+type copilotEventState struct {
+	output      strings.Builder
+	sessionID   string
+	activeModel string
+	finalStatus string
+	finalError  string
+	usage       map[string]TokenUsage
+}
+
+func newCopilotEventState(seedModel string) *copilotEventState {
+	return &copilotEventState{
+		activeModel: seedModel,
+		finalStatus: "completed",
+		usage:       make(map[string]TokenUsage),
+	}
+}
+
+// handleCopilotEvent processes a single parsed copilotEvent, updates state,
+// and returns zero or more Messages to emit. Extracted so tests can call the
+// exact same logic without duplicating the switch body.
+func handleCopilotEvent(evt copilotEvent, st *copilotEventState) []Message {
+	var msgs []Message
+
+	switch evt.Type {
+	case "session.start":
+		var ss copilotSessionStart
+		if err := json.Unmarshal(evt.Data, &ss); err == nil && ss.SelectedModel != "" {
+			st.activeModel = ss.SelectedModel
+		}
+
+	case "assistant.message_delta":
+		var delta copilotMessageDelta
+		if err := json.Unmarshal(evt.Data, &delta); err == nil && delta.DeltaContent != "" {
+			// Write to output as defense-in-depth: if the process is killed
+			// before the final assistant.message arrives, we still have text.
+			st.output.WriteString(delta.DeltaContent)
+			msgs = append(msgs, Message{Type: MessageText, Content: delta.DeltaContent})
+		}
+
+	case "assistant.message":
+		var msg copilotAssistantMessage
+		if err := json.Unmarshal(evt.Data, &msg); err != nil {
+			return nil
+		}
+		// assistant.message carries the full turn content. Since deltas
+		// already wrote to output incrementally, we reset and write the
+		// authoritative content once to avoid double-counting.
+		if msg.Content != "" {
+			// Separator between turns.
+			trimmed := strings.TrimSuffix(st.output.String(), msg.Content)
+			st.output.Reset()
+			st.output.WriteString(trimmed)
+			if st.output.Len() > 0 && !strings.HasSuffix(st.output.String(), "\n\n") {
+				st.output.WriteString("\n\n")
+			}
+			st.output.WriteString(msg.Content)
+		}
+		if msg.ReasoningText != "" {
+			msgs = append(msgs, Message{Type: MessageThinking, Content: msg.ReasoningText})
+		}
+		if msg.OutputTokens > 0 {
+			u := st.usage[st.activeModel]
+			u.OutputTokens += msg.OutputTokens
+			st.usage[st.activeModel] = u
+		}
+		for _, tr := range msg.ToolRequests {
+			var input map[string]any
+			if tr.Arguments != nil {
+				_ = json.Unmarshal(tr.Arguments, &input)
+			}
+			msgs = append(msgs, Message{
+				Type:   MessageToolUse,
+				Tool:   tr.Name,
+				CallID: tr.ToolCallID,
+				Input:  input,
+			})
+		}
+
+	case "assistant.reasoning", "assistant.reasoning_delta":
+		// Streaming thinking content — may arrive as full or delta.
+		var r copilotReasoning
+		if err := json.Unmarshal(evt.Data, &r); err == nil {
+			text := r.Content
+			if text == "" {
+				text = r.DeltaContent
+			}
+			if text != "" {
+				msgs = append(msgs, Message{Type: MessageThinking, Content: text})
+			}
+		}
+
+	case "tool.execution_complete":
+		var tc copilotToolExecComplete
+		if err := json.Unmarshal(evt.Data, &tc); err != nil {
+			return nil
+		}
+		if tc.Model != "" {
+			st.activeModel = tc.Model
+		}
+		resultContent := ""
+		if tc.Success && tc.Result != nil {
+			resultContent = tc.Result.Content
+		} else if !tc.Success {
+			if tc.Error != nil {
+				resultContent = "Error: " + tc.Error.Message
+			} else if tc.Result != nil {
+				resultContent = tc.Result.Content
+			}
+		}
+		msgs = append(msgs, Message{
+			Type:   MessageToolResult,
+			CallID: tc.ToolCallID,
+			Output: resultContent,
+		})
+
+	case "assistant.turn_start":
+		msgs = append(msgs, Message{Type: MessageStatus, Status: "running"})
+
+	case "session.error":
+		var se copilotSessionError
+		if err := json.Unmarshal(evt.Data, &se); err == nil {
+			st.finalStatus = "failed"
+			st.finalError = se.Message
+			msgs = append(msgs, Message{Type: MessageLog, Level: "error", Content: se.Message})
+		}
+
+	case "session.warning":
+		var sw copilotSessionWarning
+		if err := json.Unmarshal(evt.Data, &sw); err == nil {
+			msgs = append(msgs, Message{Type: MessageLog, Level: "warn", Content: sw.Message})
+		}
+
+	case "result":
+		st.sessionID = evt.SessionID
+		if evt.ExitCode != 0 {
+			st.finalStatus = "failed"
+			st.finalError = fmt.Sprintf("copilot exited with code %d", evt.ExitCode)
+		}
+	}
+
+	return msgs
+}
+
 func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
 	execPath := b.cfg.ExecutablePath
 	if execPath == "" {
@@ -70,12 +216,11 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 		defer close(resCh)
 
 		startTime := time.Now()
-		var output strings.Builder
-		var sessionID string
-		activeModel := "copilot"
-		finalStatus := "completed"
-		var finalError string
-		usage := make(map[string]TokenUsage)
+		seedModel := opts.Model
+		if seedModel == "" {
+			seedModel = "copilot"
+		}
+		st := newCopilotEventState(seedModel)
 
 		go func() {
 			<-runCtx.Done()
@@ -96,86 +241,8 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 				continue
 			}
 
-			switch evt.Type {
-			case "assistant.message_delta":
-				// Streaming text fragment — send to channel for real-time UI.
-				var delta copilotMessageDelta
-				if err := json.Unmarshal(evt.Data, &delta); err == nil && delta.DeltaContent != "" {
-					trySend(msgCh, Message{Type: MessageText, Content: delta.DeltaContent})
-				}
-
-			case "assistant.message":
-				// Complete assistant turn — carries final content, tool requests, and outputTokens.
-				var msg copilotAssistantMessage
-				if err := json.Unmarshal(evt.Data, &msg); err != nil {
-					continue
-				}
-				if msg.Content != "" {
-					if output.Len() > 0 {
-						output.WriteString("\n\n")
-					}
-					output.WriteString(msg.Content)
-				}
-				if msg.OutputTokens > 0 {
-					u := usage[activeModel]
-					u.OutputTokens += msg.OutputTokens
-					usage[activeModel] = u
-				}
-				for _, tr := range msg.ToolRequests {
-					var input map[string]any
-					if tr.Arguments != nil {
-						_ = json.Unmarshal(tr.Arguments, &input)
-					}
-					trySend(msgCh, Message{
-						Type:   MessageToolUse,
-						Tool:   tr.Name,
-						CallID: tr.ToolCallID,
-						Input:  input,
-					})
-				}
-
-			case "tool.execution_complete":
-				var tc copilotToolExecComplete
-				if err := json.Unmarshal(evt.Data, &tc); err != nil {
-					continue
-				}
-				if tc.Model != "" {
-					activeModel = tc.Model
-				}
-				resultContent := ""
-				if tc.Success && tc.Result != nil {
-					resultContent = tc.Result.Content
-				} else if !tc.Success {
-					if tc.Error != nil {
-						resultContent = "Error: " + tc.Error.Message
-					} else if tc.Result != nil {
-						resultContent = tc.Result.Content
-					}
-				}
-				trySend(msgCh, Message{
-					Type:   MessageToolResult,
-					CallID: tc.ToolCallID,
-					Output: resultContent,
-				})
-
-			case "assistant.turn_start":
-				trySend(msgCh, Message{Type: MessageStatus, Status: "running"})
-
-			case "session.error":
-				var se copilotSessionError
-				if err := json.Unmarshal(evt.Data, &se); err == nil {
-					finalStatus = "failed"
-					finalError = se.Message
-					trySend(msgCh, Message{Type: MessageLog, Level: "error", Content: se.Message})
-				}
-
-			case "result":
-				// Synthetic final line — top-level sessionId, exitCode, usage.
-				sessionID = evt.SessionID
-				if evt.ExitCode != 0 {
-					finalStatus = "failed"
-					finalError = fmt.Sprintf("copilot exited with code %d", evt.ExitCode)
-				}
+			for _, m := range handleCopilotEvent(evt, st) {
+				trySend(msgCh, m)
 			}
 		}
 
@@ -183,25 +250,25 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 		duration := time.Since(startTime)
 
 		if runCtx.Err() == context.DeadlineExceeded {
-			finalStatus = "timeout"
-			finalError = fmt.Sprintf("copilot timed out after %s", timeout)
+			st.finalStatus = "timeout"
+			st.finalError = fmt.Sprintf("copilot timed out after %s", timeout)
 		} else if runCtx.Err() == context.Canceled {
-			finalStatus = "aborted"
-			finalError = "execution cancelled"
-		} else if exitErr != nil && finalStatus == "completed" {
-			finalStatus = "failed"
-			finalError = fmt.Sprintf("copilot exited with error: %v", exitErr)
+			st.finalStatus = "aborted"
+			st.finalError = "execution cancelled"
+		} else if exitErr != nil && st.finalStatus == "completed" {
+			st.finalStatus = "failed"
+			st.finalError = fmt.Sprintf("copilot exited with error: %v", exitErr)
 		}
 
-		b.cfg.Logger.Info("copilot finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
+		b.cfg.Logger.Info("copilot finished", "pid", cmd.Process.Pid, "status", st.finalStatus, "duration", duration.Round(time.Millisecond).String())
 
 		resCh <- Result{
-			Status:     finalStatus,
-			Output:     output.String(),
-			Error:      finalError,
+			Status:     st.finalStatus,
+			Output:     st.output.String(),
+			Error:      st.finalError,
 			DurationMs: duration.Milliseconds(),
-			SessionID:  sessionID,
-			Usage:      usage,
+			SessionID:  st.sessionID,
+			Usage:      st.usage,
 		}
 	}()
 
@@ -233,6 +300,12 @@ type copilotEvent struct {
 	SessionID string              `json:"sessionId,omitempty"`
 	ExitCode  int                 `json:"exitCode,omitempty"`
 	Usage     *copilotResultUsage `json:"usage,omitempty"`
+}
+
+// copilotSessionStart is data payload for "session.start".
+type copilotSessionStart struct {
+	SessionID     string `json:"sessionId"`
+	SelectedModel string `json:"selectedModel"`
 }
 
 // copilotAssistantMessage is data payload for "assistant.message".
@@ -279,10 +352,22 @@ type copilotToolError struct {
 	Message string `json:"message"`
 }
 
+// copilotReasoning is data payload for "assistant.reasoning" / "assistant.reasoning_delta".
+type copilotReasoning struct {
+	Content      string `json:"content,omitempty"`
+	DeltaContent string `json:"deltaContent,omitempty"`
+}
+
 // copilotSessionError is data payload for "session.error".
 type copilotSessionError struct {
 	ErrorType string `json:"errorType"`
 	Message   string `json:"message"`
+}
+
+// copilotSessionWarning is data payload for "session.warning".
+type copilotSessionWarning struct {
+	WarningType string `json:"warningType"`
+	Message     string `json:"message"`
 }
 
 // copilotResultUsage is the usage on the final "result" line.

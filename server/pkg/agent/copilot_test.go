@@ -29,6 +29,14 @@ const fixtureSessionError = `{"type":"session.error","data":{"errorType":"rate_l
 
 const fixtureEphemeral = `{"type":"session.mcp_servers_loaded","data":{"servers":[{"name":"github-mcp-server","status":"connected","source":"builtin"}]},"id":"330ac6bb-b2db-435e-8082-686face58a72","timestamp":"2026-04-16T08:43:34.803Z","parentId":"fe20d689-31ec-492c-9eb5-57a0d0834d70","ephemeral":true}`
 
+const fixtureSessionStart = `{"type":"session.start","data":{"sessionId":"35059dc3-d928-4ffb-8616-b78938621d85","selectedModel":"claude-sonnet-4","context":{"cwd":"/tmp"}},"id":"ss-1","timestamp":"2026-04-16T08:43:34.000Z"}`
+
+const fixtureReasoning = `{"type":"assistant.reasoning","data":{"content":"Let me think about this..."},"id":"r-1","timestamp":"2026-04-16T08:43:37.000Z","parentId":"p-1"}`
+
+const fixtureReasoningDelta = `{"type":"assistant.reasoning_delta","data":{"deltaContent":"thinking step"},"id":"rd-1","timestamp":"2026-04-16T08:43:37.100Z","parentId":"p-1","ephemeral":true}`
+
+const fixtureSessionWarning = `{"type":"session.warning","data":{"warningType":"rate_limit_approaching","message":"You are approaching your rate limit"},"id":"sw-1","timestamp":"2026-04-16T09:00:00.000Z","parentId":"p-1"}`
+
 // parseCopilotEvent is a test helper that unmarshals a JSONL line into a copilotEvent.
 func parseCopilotEvent(t *testing.T, line string) copilotEvent {
 	t.Helper()
@@ -204,97 +212,25 @@ func TestCopilotParseSessionError(t *testing.T) {
 
 // ── Integration-style tests: feed fixture JSONL through the event loop ──
 
-// simulateCopilotEventLoop runs the same switch logic as copilotBackend.Execute's
-// goroutine, but without spawning a real process. This tests the mapping from
-// real Copilot JSONL to our Message/Result types.
+// simulateCopilotEventLoop feeds JSONL lines through handleCopilotEvent —
+// the exact same function used in production — and collects the results.
 func simulateCopilotEventLoop(t *testing.T, lines []string) ([]Message, string, string, map[string]TokenUsage) {
+	return simulateCopilotEventLoopWithModel(t, lines, "copilot")
+}
+
+func simulateCopilotEventLoopWithModel(t *testing.T, lines []string, seedModel string) ([]Message, string, string, map[string]TokenUsage) {
 	t.Helper()
 	var msgs []Message
-	var output strings.Builder
-	var sessionID string
-	activeModel := "copilot"
-	finalStatus := "completed"
-	usage := make(map[string]TokenUsage)
+	st := newCopilotEventState(seedModel)
 
 	for _, line := range lines {
 		var evt copilotEvent
 		if err := json.Unmarshal([]byte(line), &evt); err != nil {
 			continue
 		}
-
-		switch evt.Type {
-		case "assistant.message_delta":
-			var delta copilotMessageDelta
-			if err := json.Unmarshal(evt.Data, &delta); err == nil && delta.DeltaContent != "" {
-				msgs = append(msgs, Message{Type: MessageText, Content: delta.DeltaContent})
-			}
-		case "assistant.message":
-			var msg copilotAssistantMessage
-			if err := json.Unmarshal(evt.Data, &msg); err != nil {
-				continue
-			}
-			if msg.Content != "" {
-				if output.Len() > 0 {
-					output.WriteString("\n\n")
-				}
-				output.WriteString(msg.Content)
-			}
-			if msg.OutputTokens > 0 {
-				u := usage[activeModel]
-				u.OutputTokens += msg.OutputTokens
-				usage[activeModel] = u
-			}
-			for _, tr := range msg.ToolRequests {
-				var input map[string]any
-				if tr.Arguments != nil {
-					_ = json.Unmarshal(tr.Arguments, &input)
-				}
-				msgs = append(msgs, Message{
-					Type:   MessageToolUse,
-					Tool:   tr.Name,
-					CallID: tr.ToolCallID,
-					Input:  input,
-				})
-			}
-		case "tool.execution_complete":
-			var tc copilotToolExecComplete
-			if err := json.Unmarshal(evt.Data, &tc); err != nil {
-				continue
-			}
-			if tc.Model != "" {
-				activeModel = tc.Model
-			}
-			resultContent := ""
-			if tc.Success && tc.Result != nil {
-				resultContent = tc.Result.Content
-			} else if !tc.Success {
-				if tc.Error != nil {
-					resultContent = "Error: " + tc.Error.Message
-				} else if tc.Result != nil {
-					resultContent = tc.Result.Content
-				}
-			}
-			msgs = append(msgs, Message{
-				Type:   MessageToolResult,
-				CallID: tc.ToolCallID,
-				Output: resultContent,
-			})
-		case "assistant.turn_start":
-			msgs = append(msgs, Message{Type: MessageStatus, Status: "running"})
-		case "session.error":
-			var se copilotSessionError
-			if err := json.Unmarshal(evt.Data, &se); err == nil {
-				finalStatus = "failed"
-				msgs = append(msgs, Message{Type: MessageLog, Level: "error", Content: se.Message})
-			}
-		case "result":
-			sessionID = evt.SessionID
-			if evt.ExitCode != 0 {
-				finalStatus = "failed"
-			}
-		}
+		msgs = append(msgs, handleCopilotEvent(evt, st)...)
 	}
-	return msgs, sessionID, finalStatus, usage
+	return msgs, st.sessionID, st.finalStatus, st.usage
 }
 
 func TestCopilotEventLoopSimpleMessage(t *testing.T) {
@@ -488,6 +424,140 @@ func TestCopilotEventLoopMultiTurnUsage(t *testing.T) {
 	}
 	if u := usage["claude-opus-4.6"]; u.OutputTokens != 106 {
 		t.Fatalf("expected 106 tokens under 'claude-opus-4.6', got %d", u.OutputTokens)
+	}
+}
+
+func TestCopilotEventLoopSessionStartSetsModel(t *testing.T) {
+	t.Parallel()
+	lines := []string{
+		fixtureSessionStart,
+		fixtureTurnStart,
+		fixtureAssistantMessage, // 5 outputTokens
+		fixtureResult,
+	}
+
+	_, _, _, usage := simulateCopilotEventLoop(t, lines)
+
+	// session.start sets selectedModel to "claude-sonnet-4",
+	// so tokens should be attributed there, not "copilot".
+	if _, ok := usage["copilot"]; ok {
+		t.Fatal("expected no tokens under 'copilot' when session.start provides selectedModel")
+	}
+	u, ok := usage["claude-sonnet-4"]
+	if !ok {
+		t.Fatal("expected tokens under 'claude-sonnet-4'")
+	}
+	if u.OutputTokens != 5 {
+		t.Fatalf("expected 5 outputTokens, got %d", u.OutputTokens)
+	}
+}
+
+func TestCopilotEventLoopSeedModelFromOpts(t *testing.T) {
+	t.Parallel()
+	// No session.start — seed model comes from opts.Model (simulated via seedModel param).
+	lines := []string{
+		fixtureTurnStart,
+		fixtureAssistantMessage, // 5 outputTokens
+		fixtureResult,
+	}
+
+	_, _, _, usage := simulateCopilotEventLoopWithModel(t, lines, "gpt-4o")
+
+	u, ok := usage["gpt-4o"]
+	if !ok {
+		t.Fatal("expected tokens under 'gpt-4o'")
+	}
+	if u.OutputTokens != 5 {
+		t.Fatalf("expected 5 outputTokens, got %d", u.OutputTokens)
+	}
+}
+
+func TestCopilotEventLoopReasoning(t *testing.T) {
+	t.Parallel()
+	lines := []string{
+		fixtureReasoning,
+		fixtureReasoningDelta,
+	}
+
+	msgs, _, _, _ := simulateCopilotEventLoop(t, lines)
+
+	var thinking []string
+	for _, m := range msgs {
+		if m.Type == MessageThinking {
+			thinking = append(thinking, m.Content)
+		}
+	}
+	if len(thinking) != 2 {
+		t.Fatalf("expected 2 thinking messages, got %d: %v", len(thinking), thinking)
+	}
+	if thinking[0] != "Let me think about this..." {
+		t.Fatalf("unexpected reasoning content: %q", thinking[0])
+	}
+	if thinking[1] != "thinking step" {
+		t.Fatalf("unexpected reasoning_delta content: %q", thinking[1])
+	}
+}
+
+func TestCopilotEventLoopReasoningTextInMessage(t *testing.T) {
+	t.Parallel()
+	// assistant.message with reasoningText field set.
+	lines := []string{
+		`{"type":"assistant.message","data":{"messageId":"msg-r","content":"answer","toolRequests":[],"interactionId":"int-r","outputTokens":10,"reasoningText":"I thought carefully"},"id":"mr","timestamp":"2026-04-16T08:44:00.000Z","parentId":"p-1"}`,
+	}
+
+	msgs, _, _, _ := simulateCopilotEventLoop(t, lines)
+
+	var gotThinking bool
+	for _, m := range msgs {
+		if m.Type == MessageThinking && m.Content == "I thought carefully" {
+			gotThinking = true
+		}
+	}
+	if !gotThinking {
+		t.Fatal("expected MessageThinking from reasoningText in assistant.message")
+	}
+}
+
+func TestCopilotEventLoopSessionWarning(t *testing.T) {
+	t.Parallel()
+	lines := []string{fixtureSessionWarning}
+
+	msgs, _, status, _ := simulateCopilotEventLoop(t, lines)
+
+	// Warnings should NOT change finalStatus.
+	if status != "completed" {
+		t.Fatalf("expected completed, got %q", status)
+	}
+	var found bool
+	for _, m := range msgs {
+		if m.Type == MessageLog && m.Level == "warn" && m.Content == "You are approaching your rate limit" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected warn log message for session.warning")
+	}
+}
+
+func TestCopilotEventLoopDeltaFallbackOutput(t *testing.T) {
+	t.Parallel()
+	// Only deltas, no assistant.message — simulates process killed mid-stream.
+	lines := []string{
+		`{"type":"assistant.message_delta","data":{"messageId":"m1","deltaContent":"hello "},"id":"d1","timestamp":"2026-04-16T08:43:38.000Z","parentId":"p1","ephemeral":true}`,
+		`{"type":"assistant.message_delta","data":{"messageId":"m1","deltaContent":"world"},"id":"d2","timestamp":"2026-04-16T08:43:38.100Z","parentId":"p1","ephemeral":true}`,
+	}
+
+	st := newCopilotEventState("copilot")
+	for _, line := range lines {
+		var evt copilotEvent
+		if err := json.Unmarshal([]byte(line), &evt); err != nil {
+			t.Fatal(err)
+		}
+		handleCopilotEvent(evt, st)
+	}
+
+	if st.output.String() != "hello world" {
+		t.Fatalf("expected output 'hello world', got %q", st.output.String())
 	}
 }
 

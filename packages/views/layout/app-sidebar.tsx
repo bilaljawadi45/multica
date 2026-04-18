@@ -318,7 +318,7 @@ export function AppSidebar({ topSlot, searchSlot, headerClassName, headerStyle }
   }, [pathname]);
 
   return (
-      <Sidebar variant="inset">
+      <Sidebar variant="floating">
         {topSlot}
         {/* Workspace Switcher */}
         <SidebarHeader className={cn("py-3", headerClassName)} style={headerStyle}>

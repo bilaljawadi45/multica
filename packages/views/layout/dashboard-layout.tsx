@@ -30,9 +30,9 @@ export function DashboardLayout({
         </div>
       }
     >
-      <SidebarProvider className="h-svh">
+      <SidebarProvider className="h-svh bg-sidebar">
         <AppSidebar searchSlot={searchSlot} />
-        <SidebarInset className="relative overflow-hidden">
+        <SidebarInset className="relative overflow-hidden bg-transparent">
           {children}
           <ModalRegistry />
           {extra}

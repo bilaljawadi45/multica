@@ -1075,7 +1075,17 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, taskLo
 	switch result.Status {
 	case "completed":
 		if result.Output == "" {
-			return TaskResult{}, fmt.Errorf("%s returned empty output", provider)
+			// Even an empty-output completion may have established a real
+			// session — surface it through the blocked path so the next chat
+			// turn can still resume from where this one left off.
+			return TaskResult{
+				Status:    "blocked",
+				Comment:   fmt.Sprintf("%s returned empty output", provider),
+				SessionID: result.SessionID,
+				WorkDir:   env.WorkDir,
+				EnvRoot:   env.RootDir,
+				Usage:     usageEntries,
+			}, nil
 		}
 		return TaskResult{
 			Status:    "completed",
@@ -1086,13 +1096,36 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, taskLo
 			Usage:     usageEntries,
 		}, nil
 	case "timeout":
-		return TaskResult{}, fmt.Errorf("%s timed out after %s", provider, d.cfg.AgentTimeout)
+		// Surface session_id/work_dir so the chat resume pointer is kept
+		// in sync even when the agent times out after building a session.
+		// We mark as "blocked" (not a hard error return) so handleTask
+		// goes through the FailTask path that forwards session info.
+		return TaskResult{
+			Status:    "blocked",
+			Comment:   fmt.Sprintf("%s timed out after %s", provider, d.cfg.AgentTimeout),
+			SessionID: result.SessionID,
+			WorkDir:   env.WorkDir,
+			EnvRoot:   env.RootDir,
+			Usage:     usageEntries,
+		}, nil
 	default:
 		errMsg := result.Error
 		if errMsg == "" {
 			errMsg = fmt.Sprintf("%s execution %s", provider, result.Status)
 		}
-		return TaskResult{Status: "blocked", Comment: errMsg, EnvRoot: env.RootDir, Usage: usageEntries}, nil
+		// Forward SessionID/WorkDir on the blocked path: backends commonly
+		// emit a real session_id before failing (rate-limit, tool error,
+		// model reject, …). Without this the chat_session resume pointer
+		// would either be left stale or overwritten with NULL on the
+		// server, causing the next chat turn to lose context.
+		return TaskResult{
+			Status:    "blocked",
+			Comment:   errMsg,
+			SessionID: result.SessionID,
+			WorkDir:   env.WorkDir,
+			EnvRoot:   env.RootDir,
+			Usage:     usageEntries,
+		}, nil
 	}
 }
 

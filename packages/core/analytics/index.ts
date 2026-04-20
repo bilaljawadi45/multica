@@ -15,7 +15,11 @@
 import posthog from "posthog-js";
 
 const SIGNUP_SOURCE_COOKIE = "multica_signup_source";
-const SIGNUP_SOURCE_MAX_LEN = 256;
+// Per-value cap keeps a long utm_content from blowing the budget. We drop
+// the entire cookie if the JSON still exceeds the overall limit — partial
+// JSON is worse than no attribution because PostHog can't parse it.
+const SIGNUP_SOURCE_VALUE_MAX_LEN = 96;
+const SIGNUP_SOURCE_MAX_LEN = 512;
 const UTM_KEYS = [
   "utm_source",
   "utm_medium",
@@ -30,6 +34,11 @@ let initialized = false;
 // most recent pending identify (only one matters, since it's per-session)
 // and flush it inside initAnalytics.
 let pendingIdentify: { userId: string; props?: Record<string, unknown> } | null = null;
+// Likewise pageviews: the initial "/" pageview is the anchor of the
+// acquisition funnel, and the Next.js router fires it on mount before the
+// config fetch resolves. We keep the first pending pageview so that step
+// doesn't silently drop.
+let pendingPageview: string | undefined | null = null;
 
 export interface AnalyticsConfig {
   key: string;
@@ -66,6 +75,11 @@ export function initAnalytics(config: AnalyticsConfig | null | undefined): boole
     posthog.identify(pendingIdentify.userId, pendingIdentify.props);
     pendingIdentify = null;
   }
+  // And any first pageview we captured while config was loading.
+  if (pendingPageview !== null) {
+    posthog.capture("$pageview", pendingPageview ? { $current_url: pendingPageview } : undefined);
+    pendingPageview = null;
+  }
   return true;
 }
 
@@ -92,6 +106,7 @@ export function identify(userId: string, userProperties?: Record<string, unknown
  */
 export function resetAnalytics(): void {
   pendingIdentify = null;
+  pendingPageview = null;
   if (!initialized) return;
   posthog.reset();
 }
@@ -101,9 +116,17 @@ export function resetAnalytics(): void {
  * posthog's automatic pageview tracking in init() so this module owns the
  * event shape — that makes it trivial to add properties (e.g. workspace
  * slug) without fighting the SDK.
+ *
+ * Calls before initAnalytics() buffer the most-recent path so the first
+ * pageview isn't dropped on slow /api/config fetches. Subsequent pre-init
+ * pageviews overwrite the buffer; after init flushes, every navigation
+ * captures synchronously as expected.
  */
 export function capturePageview(path?: string): void {
-  if (!initialized) return;
+  if (!initialized) {
+    pendingPageview = path ?? "";
+    return;
+  }
   posthog.capture("$pageview", path ? { $current_url: path } : undefined);
 }
 
@@ -124,22 +147,29 @@ export function captureSignupSource(): void {
   if (readCookie(SIGNUP_SOURCE_COOKIE)) return;
 
   const source: Record<string, string> = {};
+  const cap = (v: string) =>
+    v.length > SIGNUP_SOURCE_VALUE_MAX_LEN ? v.slice(0, SIGNUP_SOURCE_VALUE_MAX_LEN) : v;
+
   try {
     const params = new URLSearchParams(window.location.search);
     for (const key of UTM_KEYS) {
       const v = params.get(key);
-      if (v) source[key] = v;
+      if (v) source[key] = cap(v);
     }
   } catch {
     // URL APIs unavailable — skip silently.
   }
 
   const refOrigin = safeReferrerOrigin(document.referrer);
-  if (refOrigin) source.referrer_origin = refOrigin;
+  if (refOrigin) source.referrer_origin = cap(refOrigin);
 
   if (Object.keys(source).length === 0) return;
 
-  const payload = JSON.stringify(source).slice(0, SIGNUP_SOURCE_MAX_LEN);
+  const payload = JSON.stringify(source);
+  // Drop rather than mid-JSON truncate — a half-string would fail to parse
+  // on the backend and the attribution would be worse than missing.
+  if (payload.length > SIGNUP_SOURCE_MAX_LEN) return;
+
   // 30-day expiry covers the typical signup consideration window. Lax is
   // the right default — the cookie is only consumed by same-origin auth.
   const maxAge = 60 * 60 * 24 * 30;

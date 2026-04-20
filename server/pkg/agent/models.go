@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -63,11 +65,9 @@ func ListModels(ctx context.Context, providerType, executablePath string) ([]Mod
 	case "copilot":
 		return copilotStaticModels(), nil
 	case "hermes":
-		// Hermes does not honour per-task model selection (model is
-		// fixed via ~/.hermes/.env). ModelSelectionSupported returns
-		// false for hermes so the UI disables the dropdown instead
-		// of silently ignoring what the user types.
-		return []Model{}, nil
+		return cachedDiscovery(providerType, func() ([]Model, error) {
+			return discoverHermesModels(ctx, executablePath)
+		})
 	case "opencode":
 		return cachedDiscovery(providerType, func() ([]Model, error) {
 			return discoverOpenCodeModels(ctx, executablePath)
@@ -86,18 +86,15 @@ func ListModels(ctx context.Context, providerType, executablePath string) ([]Mod
 }
 
 // ModelSelectionSupported reports whether setting `agent.model` has
-// any effect for the given provider. Returns false for providers
-// that drive model selection through out-of-band configuration
-// (currently hermes, which reads ~/.hermes/.env) — the UI uses this
-// to disable its dropdown instead of silently accepting a value the
-// backend will ignore.
+// any effect for the given provider. Today every provider in the
+// registry honours `opts.Model` end-to-end: Hermes routes it through
+// the ACP `session/set_model` RPC before each prompt, which means
+// the UI's dropdown choice is carried all the way down to the LLM
+// call. The helper is retained so we can add a `return false` branch
+// the next time a provider legitimately ignores model selection.
 func ModelSelectionSupported(providerType string) bool {
-	switch providerType {
-	case "hermes":
-		return false
-	default:
-		return true
-	}
+	_ = providerType
+	return true
 }
 
 // DefaultModel returns the provider's recommended default model ID,
@@ -339,6 +336,187 @@ func parsePiModels(output string) []Model {
 			provider = id[:i]
 		}
 		models = append(models, Model{ID: id, Label: id, Provider: provider})
+	}
+	return models
+}
+
+// discoverHermesModels spins up a throwaway `hermes acp` process,
+// drives just enough of the protocol to receive the model list
+// advertised in the `session/new` response, and shuts it down. The
+// list and the `current` flag both come from hermes' own
+// `_build_model_state` so whatever ~/.hermes/config.yaml resolves
+// to at runtime is exactly what the UI shows.
+//
+// Failure modes (hermes missing, no credentials, config resolution
+// error) all return an empty list so the UI falls back to the
+// creatable manual-entry input instead of blocking the form.
+func discoverHermesModels(ctx context.Context, executablePath string) ([]Model, error) {
+	if executablePath == "" {
+		executablePath = "hermes"
+	}
+	if _, err := exec.LookPath(executablePath); err != nil {
+		return []Model{}, nil
+	}
+	runCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(runCtx, executablePath, "acp")
+	// Mirror the real backend's auto-approve so init doesn't prompt.
+	cmd.Env = append(os.Environ(), "HERMES_YOLO_MODE=1")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return []Model{}, nil
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		stdin.Close()
+		return []Model{}, nil
+	}
+	// Discard stderr; noisy logs here don't help us and we don't
+	// want them bleeding into the daemon log every 60s.
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		return []Model{}, nil
+	}
+	// Ensure the child process is always reaped.
+	defer func() {
+		_ = stdin.Close()
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+
+	writeACP := func(id int, method string, params map[string]any) error {
+		msg := map[string]any{
+			"jsonrpc": "2.0",
+			"id":      id,
+			"method":  method,
+			"params":  params,
+		}
+		data, err := json.Marshal(msg)
+		if err != nil {
+			return err
+		}
+		data = append(data, '\n')
+		_, err = stdin.Write(data)
+		return err
+	}
+
+	// Send initialize + session/new.
+	if err := writeACP(1, "initialize", map[string]any{
+		"protocolVersion":    1,
+		"clientInfo":         map[string]any{"name": "multica-model-discovery", "version": "0.1.0"},
+		"clientCapabilities": map[string]any{},
+	}); err != nil {
+		return []Model{}, nil
+	}
+
+	// Hermes requires a valid cwd for session/new — use a temp
+	// directory we clean up afterwards, not the daemon's workdir
+	// (which might be in the middle of another task's worktree).
+	tmp, err := os.MkdirTemp("", "multica-hermes-discovery-")
+	if err != nil {
+		return []Model{}, nil
+	}
+	defer os.RemoveAll(tmp)
+
+	if err := writeACP(2, "session/new", map[string]any{
+		"cwd":        tmp,
+		"mcpServers": []any{},
+	}); err != nil {
+		return []Model{}, nil
+	}
+
+	// Read responses until we see the one for id=2 (session/new).
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 4*1024*1024)
+	deadline := time.After(12 * time.Second)
+	done := make(chan []Model, 1)
+	go func() {
+		defer close(done)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			var env struct {
+				ID     json.Number     `json:"id"`
+				Result json.RawMessage `json:"result"`
+			}
+			if err := json.Unmarshal([]byte(line), &env); err != nil {
+				continue
+			}
+			if env.ID.String() != "2" || len(env.Result) == 0 {
+				continue
+			}
+			done <- parseHermesSessionNewModels(env.Result)
+			return
+		}
+	}()
+
+	select {
+	case models := <-done:
+		if models == nil {
+			return []Model{}, nil
+		}
+		return models, nil
+	case <-deadline:
+		return []Model{}, nil
+	case <-runCtx.Done():
+		return []Model{}, nil
+	}
+}
+
+// parseHermesSessionNewModels extracts the model catalog from a
+// hermes `session/new` response. Hermes' ACP schema emits:
+//
+//	{
+//	  "sessionId": "...",
+//	  "models": {
+//	    "availableModels": [
+//	      {"modelId": "...", "name": "...", "description": "... current"}
+//	    ],
+//	    "currentModelId": "..."
+//	  }
+//	}
+//
+// Returns nil (not an empty slice) when the payload is missing so
+// the caller can distinguish "parsed with no models" (valid but
+// empty catalog) from "couldn't find the structure at all".
+func parseHermesSessionNewModels(raw json.RawMessage) []Model {
+	var resp struct {
+		Models struct {
+			AvailableModels []struct {
+				ModelID     string `json:"modelId"`
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			} `json:"availableModels"`
+			CurrentModelID string `json:"currentModelId"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil
+	}
+	models := make([]Model, 0, len(resp.Models.AvailableModels))
+	seen := map[string]bool{}
+	for _, m := range resp.Models.AvailableModels {
+		if m.ModelID == "" || seen[m.ModelID] {
+			continue
+		}
+		seen[m.ModelID] = true
+		label := m.Name
+		if label == "" {
+			label = m.ModelID
+		}
+		provider := ""
+		if idx := strings.Index(m.ModelID, ":"); idx > 0 {
+			provider = m.ModelID[:idx]
+		}
+		models = append(models, Model{
+			ID:       m.ModelID,
+			Label:    label,
+			Provider: provider,
+			Default:  m.ModelID == resp.Models.CurrentModelID,
+		})
 	}
 	return models
 }

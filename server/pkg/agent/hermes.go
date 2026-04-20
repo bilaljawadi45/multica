@@ -190,13 +190,31 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		c.sessionID = sessionID
 		b.cfg.Logger.Info("hermes session created", "session_id", sessionID)
 
-		// 3. Build the prompt content. If we have a system prompt, prepend it.
+		// 3. If the caller picked a model (via agent.model from the
+		// UI dropdown), ask hermes to switch the session to it
+		// before we send any prompt. Hermes' _build_model_state
+		// exposes modelId as `provider:model` — we pass that
+		// through verbatim. A failure here is logged but not
+		// fatal: the session is still usable on hermes' default
+		// model, which beats aborting the task outright.
+		if opts.Model != "" {
+			if _, err := c.request(runCtx, "session/set_model", map[string]any{
+				"sessionId": sessionID,
+				"modelId":   opts.Model,
+			}); err != nil {
+				b.cfg.Logger.Warn("hermes set_session_model failed; continuing with default", "error", err, "requested_model", opts.Model)
+			} else {
+				b.cfg.Logger.Info("hermes session model set", "model", opts.Model)
+			}
+		}
+
+		// 4. Build the prompt content. If we have a system prompt, prepend it.
 		userText := prompt
 		if opts.SystemPrompt != "" {
 			userText = opts.SystemPrompt + "\n\n---\n\n" + prompt
 		}
 
-		// 4. Send the prompt and wait for PromptResponse.
+		// 5. Send the prompt and wait for PromptResponse.
 		_, err = c.request(runCtx, "session/prompt", map[string]any{
 			"sessionId": sessionID,
 			"prompt": []map[string]any{

@@ -27,14 +27,23 @@ func TestListModelsStaticProviders(t *testing.T) {
 	}
 }
 
-func TestListModelsHermesReturnsEmpty(t *testing.T) {
+func TestListModelsHermesWithoutBinary(t *testing.T) {
+	// With no `hermes` binary on PATH the discovery fast-paths to
+	// an empty list (the UI then falls back to creatable manual
+	// entry). This test only verifies the fast-path; an actual
+	// ACP session is exercised in integration.
 	ctx := context.Background()
-	got, err := ListModels(ctx, "hermes", "")
+	// Prime the cache miss so we hit the live discovery function.
+	modelCacheMu.Lock()
+	delete(modelCache, "hermes")
+	modelCacheMu.Unlock()
+
+	got, err := ListModels(ctx, "hermes", "/nonexistent/hermes")
 	if err != nil {
 		t.Fatalf("ListModels(hermes) error: %v", err)
 	}
-	if len(got) != 0 {
-		t.Errorf("ListModels(hermes) expected empty, got %d", len(got))
+	if got == nil {
+		t.Error("expected non-nil slice even when binary is missing")
 	}
 }
 
@@ -244,6 +253,63 @@ composer-2 - Composer 2
 	models := parseCursorModels(input)
 	if len(models) != 1 || models[0].ID != "composer-2" {
 		t.Fatalf("unexpected: %+v", models)
+	}
+}
+
+func TestParseHermesSessionNewModels(t *testing.T) {
+	// Mirrors the real shape emitted by hermes'
+	// acp_adapter/server.py _build_model_state -> SessionModelState.
+	raw := []byte(`{
+      "sessionId": "ses_123",
+      "models": {
+        "availableModels": [
+          {"modelId": "nous:moonshotai/kimi-k2.5", "name": "moonshotai/kimi-k2.5", "description": "Provider: Nous"},
+          {"modelId": "nous:anthropic/claude-opus-4.7", "name": "anthropic/claude-opus-4.7", "description": "Provider: Nous • current"},
+          {"modelId": "nous:moonshotai/kimi-k2.5", "name": "duplicate", "description": "dup"}
+        ],
+        "currentModelId": "nous:anthropic/claude-opus-4.7"
+      }
+    }`)
+	models := parseHermesSessionNewModels(raw)
+	if len(models) != 2 {
+		t.Fatalf("expected 2 models (duplicate deduped), got %d: %+v", len(models), models)
+	}
+	if models[0].ID != "nous:moonshotai/kimi-k2.5" || models[0].Provider != "nous" {
+		t.Errorf("unexpected first model: %+v", models[0])
+	}
+	if models[0].Default {
+		t.Errorf("non-current entry must not be marked default: %+v", models[0])
+	}
+	if !models[1].Default {
+		t.Errorf("current entry must be marked default: %+v", models[1])
+	}
+	if models[1].ID != "nous:anthropic/claude-opus-4.7" {
+		t.Errorf("expected current model second: %+v", models[1])
+	}
+}
+
+func TestParseHermesSessionNewModelsMissingField(t *testing.T) {
+	// session/new without the models field — older hermes or
+	// failed _build_model_state — should yield nil so the caller
+	// can distinguish "no catalog" from "empty catalog".
+	raw := []byte(`{"sessionId": "ses_123"}`)
+	if got := parseHermesSessionNewModels(raw); got != nil && len(got) != 0 {
+		t.Errorf("expected nil/empty, got %+v", got)
+	}
+}
+
+func TestParseHermesSessionNewModelsGarbage(t *testing.T) {
+	if got := parseHermesSessionNewModels([]byte("not json")); got != nil {
+		t.Errorf("expected nil for non-JSON, got %+v", got)
+	}
+}
+
+func TestHermesModelSelectionSupported(t *testing.T) {
+	// Regression guard: hermes now supports model selection via
+	// the ACP session/set_model RPC, so the UI dropdown should
+	// not be disabled for it.
+	if !ModelSelectionSupported("hermes") {
+		t.Error("hermes should be model-selection-supported now that set_session_model is wired")
 	}
 }
 

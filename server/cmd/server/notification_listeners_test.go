@@ -48,13 +48,17 @@ func addTestSubscriber(t *testing.T, issueID, userType, userID, reason string) {
 }
 
 // createTestSubIssue inserts an issue with parent_issue_id set and returns its UUID.
+// Picks the next per-workspace number to avoid colliding with the
+// uq_issue_workspace_number unique constraint (parent + sub created in the
+// same test would otherwise both default to number=0).
 func createTestSubIssue(t *testing.T, workspaceID, creatorID, parentIssueID string) string {
 	t.Helper()
 	ctx := context.Background()
 	var issueID string
 	err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, position, parent_issue_id)
-		VALUES ($1, 'sub-issue test', 'todo', 'medium', 'member', $2, 0, $3)
+		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, position, parent_issue_id, number)
+		VALUES ($1, 'sub-issue test', 'todo', 'medium', 'member', $2, 0, $3,
+		        (SELECT COALESCE(MAX(number), 0) + 1 FROM issue WHERE workspace_id = $1))
 		RETURNING id
 	`, workspaceID, creatorID, parentIssueID).Scan(&issueID)
 	if err != nil {
@@ -703,12 +707,14 @@ func TestNotification_ParentBubble_StatusChanged(t *testing.T) {
 	t.Cleanup(func() { cleanupTestUser(t, parentSubEmail) })
 
 	parentID := createTestIssue(t, testWorkspaceID, testUserID)
+	t.Cleanup(func() {
+		cleanupInboxForIssue(t, parentID)
+		cleanupTestIssue(t, parentID)
+	})
 	subID := createTestSubIssue(t, testWorkspaceID, testUserID, parentID)
 	t.Cleanup(func() {
 		cleanupInboxForIssue(t, subID)
 		cleanupTestIssue(t, subID)
-		cleanupInboxForIssue(t, parentID)
-		cleanupTestIssue(t, parentID)
 	})
 
 	// Subscribe a watcher to the parent only — they should hear about
@@ -767,12 +773,14 @@ func TestNotification_ParentBubble_NewCommentSuppressed(t *testing.T) {
 	t.Cleanup(func() { cleanupTestUser(t, parentSubEmail) })
 
 	parentID := createTestIssue(t, testWorkspaceID, testUserID)
+	t.Cleanup(func() {
+		cleanupInboxForIssue(t, parentID)
+		cleanupTestIssue(t, parentID)
+	})
 	subID := createTestSubIssue(t, testWorkspaceID, testUserID, parentID)
 	t.Cleanup(func() {
 		cleanupInboxForIssue(t, subID)
 		cleanupTestIssue(t, subID)
-		cleanupInboxForIssue(t, parentID)
-		cleanupTestIssue(t, parentID)
 	})
 
 	addTestSubscriber(t, parentID, "member", parentSubID, "manual")
@@ -813,12 +821,14 @@ func TestNotification_ParentBubble_PriorityChangeSuppressed(t *testing.T) {
 	t.Cleanup(func() { cleanupTestUser(t, parentSubEmail) })
 
 	parentID := createTestIssue(t, testWorkspaceID, testUserID)
+	t.Cleanup(func() {
+		cleanupInboxForIssue(t, parentID)
+		cleanupTestIssue(t, parentID)
+	})
 	subID := createTestSubIssue(t, testWorkspaceID, testUserID, parentID)
 	t.Cleanup(func() {
 		cleanupInboxForIssue(t, subID)
 		cleanupTestIssue(t, subID)
-		cleanupInboxForIssue(t, parentID)
-		cleanupTestIssue(t, parentID)
 	})
 
 	addTestSubscriber(t, parentID, "member", parentSubID, "manual")

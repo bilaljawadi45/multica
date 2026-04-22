@@ -1,0 +1,1 @@
+-- No-op: 056 is an audit-only migration. Nothing to roll back.

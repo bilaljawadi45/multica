@@ -37,17 +37,11 @@ VALUES (
 )
 ON CONFLICT (id) DO NOTHING;
 
--- A baseline agent — some future E2E tests will need an assignee of assignee_type='agent'.
-INSERT INTO agent (id, workspace_id, name, runtime_mode, status, owner_id)
-VALUES (
-  '00000000-0000-0000-0000-000000000301',
-  '00000000-0000-0000-0000-000000000001',
-  'Sandbox Agent',
-  'local',
-  'idle',
-  '00000000-0000-0000-0000-000000000101'
-)
-ON CONFLICT (id) DO NOTHING;
+-- NOTE: we intentionally DO NOT seed an agent here — later migrations
+-- (002_agent_config, 004_agent_runtime_loop, 013_runtime_usage) added
+-- NOT NULL columns like runtime_id that reference a separate runtimes
+-- table. Agents aren't required for the current smoke specs; add them
+-- per-test via the API when/if needed.
 
 -- One visible issue so the UI has something to render.
 INSERT INTO issue (

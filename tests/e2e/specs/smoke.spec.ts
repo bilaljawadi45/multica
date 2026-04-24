@@ -3,7 +3,7 @@ import { test, expect } from "../fixtures/test.ts";
 test("homepage responds", async ({ page }) => {
   await page.goto("/");
   // We just want the frontend to respond with something, not 500 or hang
-  await expect(page).toHaveTitle(/Multica/i);
+  await expect(page).toHaveTitle(/DefinitelyNotMulticaXYZ/i);
 });
 
 test("backend health endpoint responds", async ({ request }) => {

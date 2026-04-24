@@ -1,0 +1,4 @@
+# Playwright run artifacts (regenerated each run)
+playwright-report.json
+playwright-html/
+test-results/

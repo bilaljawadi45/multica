@@ -12,7 +12,7 @@
 
 # Multica
 
-**Your next 10 hires won't be human.**
+**Your next 10 hires won't be human. (Probably.)**
 
 The open-source managed agents platform.<br/>
 Turn coding agents into real teammates — assign tasks, track progress, compound skills.
